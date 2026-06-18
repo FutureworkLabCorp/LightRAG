@@ -908,6 +908,7 @@ async def openai_embed(
     context: str = "document",
     query_prefix: str | None = None,
     document_prefix: str | None = None,
+    extra_body: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Generate embeddings for a list of texts using OpenAI's API with automatic text truncation.
 
@@ -1021,6 +1022,9 @@ async def openai_embed(
         # Add dimensions parameter only if embedding_dim is provided
         if embedding_dim is not None:
             api_params["dimensions"] = embedding_dim
+
+        if extra_body is not None:
+            api_params["extra_body"] = extra_body
 
         # Make API call
         response = await openai_async_client.embeddings.create(**api_params)
