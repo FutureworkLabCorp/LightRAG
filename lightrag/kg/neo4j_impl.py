@@ -189,17 +189,20 @@ class Neo4JStorage(BaseGraphStorage):
             )
             """The default value approach for the DATABASE is only intended to maintain compatibility with legacy practices."""
 
-            self._driver: AsyncDriver = AsyncGraphDatabase.driver(
-                URI,
-                auth=(USERNAME, PASSWORD),
-                max_connection_pool_size=MAX_CONNECTION_POOL_SIZE,
-                connection_timeout=CONNECTION_TIMEOUT,
-                connection_acquisition_timeout=CONNECTION_ACQUISITION_TIMEOUT,
-                max_transaction_retry_time=MAX_TRANSACTION_RETRY_TIME,
-                max_connection_lifetime=MAX_CONNECTION_LIFETIME,
-                liveness_check_timeout=LIVENESS_CHECK_TIMEOUT,
-                keep_alive=KEEP_ALIVE,
-            )
+            def _open_driver() -> AsyncDriver:
+                return AsyncGraphDatabase.driver(
+                    URI,
+                    auth=(USERNAME, PASSWORD),
+                    max_connection_pool_size=MAX_CONNECTION_POOL_SIZE,
+                    connection_timeout=CONNECTION_TIMEOUT,
+                    connection_acquisition_timeout=CONNECTION_ACQUISITION_TIMEOUT,
+                    max_transaction_retry_time=MAX_TRANSACTION_RETRY_TIME,
+                    max_connection_lifetime=MAX_CONNECTION_LIFETIME,
+                    liveness_check_timeout=LIVENESS_CHECK_TIMEOUT,
+                    keep_alive=KEEP_ALIVE,
+                )
+
+            self._driver: AsyncDriver = _open_driver()
 
             # Try to connect to the database and create it if it doesn't exist
             for database in (DATABASE, None):
@@ -262,6 +265,26 @@ class Neo4JStorage(BaseGraphStorage):
                                     f"[{self.workspace}] Failed to create {database} at {URI}"
                                 )
                                 raise e
+                except neo4jExceptions.DatabaseError as e:
+                    # Neo4j reports a missing database as ClientError with a specific code,
+                    # caught above. Other Bolt servers (e.g. ArcadeDB) raise this generic
+                    # error instead, and — unlike Neo4j — bind the database name to the
+                    # connection rather than the session: once a connection has failed to
+                    # open a named database, every later session on it fails the same way,
+                    # with no database= at all. Retrying `CREATE DATABASE` on this
+                    # connection would only repeat the same failure, so the driver is
+                    # replaced before the next fallback attempt instead.
+                    if "does not exist" in str(e) and database is not None:
+                        logger.warning(
+                            f"[{self.workspace}] Database {database} at {URI} not found "
+                            "and this Bolt server does not support creating it over the "
+                            "same connection. Reconnecting and falling back to the "
+                            "default database."
+                        )
+                        await self._driver.close()
+                        self._driver = _open_driver()
+                    else:
+                        raise e
 
                 if connected:
                     workspace_label = self._get_workspace_label()
@@ -410,7 +433,14 @@ class Neo4JStorage(BaseGraphStorage):
 
         except Exception as e:
             # Handle cases where the command might not be supported
-            if "Unknown command" in str(e) or "invalid syntax" in str(e).lower():
+            if (
+                "Unknown command" in str(e)
+                or "invalid syntax" in str(e).lower()
+                # ArcadeDB's Bolt server accepts CREATE FULLTEXT INDEX syntactically but
+                # rejects the FULLTEXT index type itself, for both the CJK and the plain
+                # analyzer attempt, with this message.
+                or "index types are supported" in str(e)
+            ):
                 logger.warning(
                     f"[{self.workspace}] Could not create or verify full-text index '{index_name}'. "
                     "This might be because you are using a Neo4j version that does not support it. "
@@ -1274,6 +1304,11 @@ class Neo4JStorage(BaseGraphStorage):
         result = KnowledgeGraph()
         seen_nodes = set()
         seen_edges = set()
+        # Set when the apoc.path.subgraphAll `limit` config key is the only thing
+        # standing between us and an oversized payload. Neo4j honours it; some other
+        # Bolt servers accept the key syntactically and ignore it, so the node count
+        # is re-checked client-side rather than trusted from the query alone.
+        enforce_apoc_limit = False
 
         async with self._driver.session(
             database=self._DATABASE, default_access_mode="READ"
@@ -1376,6 +1411,7 @@ class Neo4JStorage(BaseGraphStorage):
                         else:
                             # If node count exceeds limit, set truncated flag and run limited query
                             result.is_truncated = True
+                            enforce_apoc_limit = True
                             logger.info(
                                 f"[{self.workspace}] Graph truncated: {total_nodes} nodes found, breadth-first search limited to {max_nodes}"
                             )
@@ -1447,6 +1483,20 @@ class Neo4JStorage(BaseGraphStorage):
                                 )
                             )
                             seen_edges.add(edge_id)
+
+                    if enforce_apoc_limit and len(result.nodes) > max_nodes:
+                        logger.warning(
+                            f"[{self.workspace}] apoc.path.subgraphAll returned {len(result.nodes)} "
+                            f"nodes despite limit={max_nodes}; truncating client-side "
+                            "(seen on Bolt servers that accept but do not honour the limit key)."
+                        )
+                        kept_ids = {node.id for node in result.nodes[:max_nodes]}
+                        result.nodes = result.nodes[:max_nodes]
+                        result.edges = [
+                            edge
+                            for edge in result.edges
+                            if edge.source in kept_ids and edge.target in kept_ids
+                        ]
 
                     logger.info(
                         f"[{self.workspace}] Subgraph query successful | Node count: {len(result.nodes)} | Edge count: {len(result.edges)}"
